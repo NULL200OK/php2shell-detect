@@ -3,7 +3,7 @@
 ### Defensive Detector + Bounded Offensive Impact-Evidence Builder for CVE-2026-109618 / CVE-2026-109619 ("PHP2Shell")
 
 <p align="center">
-  <strong>v3.4</strong> &nbsp;•&nbsp;
+  <strong>v3.5</strong> &nbsp;•&nbsp;
   <strong>Python 3.8+</strong> &nbsp;•&nbsp;
   <strong>Zero dependencies</strong> &nbsp;•&nbsp;
   <strong>MIT License</strong>
@@ -22,6 +22,7 @@
 - [Detection Modes (Passive / Defensive)](#detection-modes-passive--defensive)
 - [Impact Modes (Active, Lab-Only)](#impact-modes-active-lab-only)
 - [Offensive Modes (Bounded, Double Opt-In)](#offensive-modes-bounded-double-opt-in)
+- [Offensive RCE Modes (Proves Code Execution)](#offensive-rce-modes-proves-code-execution)
 - [Profiles](#profiles)
 - [Complete CLI Reference](#complete-cli-reference)
 - [Usage Examples](#usage-examples)
@@ -43,15 +44,17 @@ upload-progress handler (`ext/session/session_upload_progress.c`).
 
 The tool is **defensive-first**: the default profile runs only passive
 checks that never send a single byte of payload to the target. A bounded
-**offensive layer** is available behind a double opt-in (`--i-own-this-target`
-+ `--enable-offensive`) for operators who need to prove concrete attacker
-impact on infrastructure they own or are authorized to test.
+**offensive layer** (v3.4) and a **bounded RCE-proof layer** (v3.5) are
+available behind a double opt-in (`--i-own-this-target` +
+`--enable-offensive`) for operators who need to prove concrete attacker
+impact — up to and including code execution — on infrastructure they own
+or are authorized to test.
 
 **What this tool IS:**
 - A defender's triage kit for "is my PHP vulnerable?"
 - A blue-team evidence-gathering tool for incident response
 - A patch-validation tool (run before/after upgrade)
-- A bounded impact-proof tool for authorized penetration tests
+- A bounded impact-proof tool for authorized penetration tests (up to RCE proof)
 - A CI/CD gate (deterministic exit codes, JSON output)
 
 **What this tool is NOT:**
@@ -75,11 +78,12 @@ the cleanup path can free the same pointer twice, or the session upload
 progress handler writes attacker-controlled data into the wrong session
 file when the worker crashes mid-request.
 
-**Impact chain:**
+**Impact chain (v3.5 covers all 5 levels):**
 1. **Availability** — repeated crashes = bounded DoS
 2. **Integrity** — attacker-controlled marker persists in session files
 3. **Confidentiality** — marker from session A can appear in session B (cross-session leak)
-4. **Code Execution** (in some configs) — session file is includable via LFI / path-traversal sinks, or extension checks fail during the corrupted window
+4. **Code Execution (read primitive)** — session file is includable via LFI / path-traversal sinks
+5. **Code Execution (RCE proof)** — planted PHP code actually executes; filter-chain / phar / tmpfile / log-poisoning RCE vectors confirmed
 
 ---
 
@@ -101,16 +105,22 @@ file when the worker crashes mid-request.
 │  LAYER 3 — Bounded Offensive (+ --enable-offensive)         │
 │  offensive-session-lfi / offensive-session-traversal /      │
 │  offensive-upload-bypass-verify / offensive-race-poison     │
-│  → "What real-world attacker capability does this unlock?"  │
+│  → "What read primitive does the attacker get?"             │
+├─────────────────────────────────────────────────────────────┤
+│  LAYER 4 — Bounded RCE Proof (+ --enable-offensive) [v3.5]  │
+│  offensive-phpcode-exec-proof / offensive-filter-chain-rce  │
+│  offensive-phar-deserialization / offensive-tmpfile-race    │
+│  offensive-log-poisoning                                    │
+│  → "Can the attacker actually execute PHP code?"            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-The offensive layer is **bounded**:
-- It plants a **random marker string** (never PHP code)
-- It only reads back **its own marker** (never system files)
-- It never installs persistent backdoors
-- It never executes remote commands
-- It never pivots to other hosts
+All offensive and RCE-proof layers are **bounded**:
+- They plant a **random marker string** or `<?php echo 'MARKER'; ?>` ONLY
+- They never call `system()`, `exec()`, `shell_exec()`, `passthru()`, `file_put_contents()`, or any dangerous function
+- They never install persistent backdoors
+- They never execute remote commands
+- They never pivot to other hosts
 
 ---
 
@@ -123,9 +133,6 @@ The offensive layer is **bounded**:
 | 8.3.x      | **8.3.36**           |
 | 8.2.x      | **8.2.35**           |
 | < 8.2      | not supported — upgrade immediately |
-
-The tool's `verdict()` function compares the detected version against this
-table. Versions below the branch minimum are reported as `vulnerable`.
 
 ---
 
@@ -150,15 +157,8 @@ python3 php2shell-detect.py --version
 ### Requirements
 
 - **Python 3.8+** (uses only the standard library — no pip install needed)
+- Optional for `offensive-phar-deserialization`: `php` CLI in `PATH` (for phar generation)
 - Works on Linux, macOS, and WSL
-- Optional for local modes: `php` / `php-fpm` binaries in `PATH`, `pgrep`, `rpm`
-
-Verify your environment:
-
-```bash
-python3 --version        # must be >= 3.8
-python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
-```
 
 ---
 
@@ -194,14 +194,25 @@ python3 php2shell-detect.py -t http://lab.local --profile impact \
   --output impact.json --markdown impact.md
 ```
 
-### 5. Full defensive + offensive impact proof (authorized pentest)
+### 5. Bounded offensive read-primitive proof (authorized pentest)
 
 ```bash
-python3 php2shell-detect.py -t http://lab.local --profile full+offensive \
+python3 php2shell-detect.py -t http://lab.local --profile offensive \
   --i-own-this-target --enable-offensive \
+  --upload-endpoint /upload.php \
+  --evidence-bundle ./evidence
+```
+
+### 6. Full RCE proof (authorized pentest, maximum impact proof) — NEW in v3.5
+
+```bash
+python3 php2shell-detect.py -t http://lab.local --profile offensive-rce \
+  --i-own-this-target --enable-offensive \
+  --upload-endpoint /upload.php \
+  --include-params "include,page,file,template,src,doc" \
   --rounds 30 --workers 8 \
-  --evidence-bundle ./evidence-2026-10-21 \
-  --impact-report ./impact.md
+  --evidence-bundle ./rce-evidence \
+  --impact-report ./rce-impact.md
 ```
 
 ---
@@ -221,10 +232,6 @@ Fetches the target URL and extracts the PHP version from:
 - Optionally probes `/phpinfo.php`, `/info.php`, `/test.php` with `--probe-phpinfo`
 
 Automatic HTTPS → HTTP fallback if TLS fails.
-
-```bash
-python3 php2shell-detect.py --mode remote -t https://example.com --probe-phpinfo
-```
 
 ### `surface`
 Crawls `/`, `/contact.php`, `/contact`, `/upload.php`, `/upload` looking for:
@@ -247,67 +254,38 @@ Probes 17 sensitive paths for version disclosure and exposure:
 /.git/HEAD  /server-status  /server-info
 ```
 
-Reports inconsistent version disclosures (e.g. header says 8.3.30 but
-phpinfo body says 8.3.28 — a sign of a reverse-proxy version-masking
-misconfiguration).
+Reports inconsistent version disclosures.
 
 ### `local`
 Scans the local host for:
 - PHP binaries in `PATH` (`php`, `php8.x`, `php-fpm8.x`)
 - Running `php-fpm` workers via `pgrep`
-- Debian/Ubuntu changelogs in `/usr/share/doc/php*/changelog.*.gz` (CVE mentions)
+- Debian/Ubuntu changelogs in `/usr/share/doc/php*/changelog.*.gz`
 - RPM changelogs via `rpm -q --changelog`
 
 ### `logs`
-Parses Apache/nginx access logs (Common Log Format) for:
-- `Allowed memory size of N bytes exhausted` (OOM)
-- `use-after-free`, `heap-buffer`, `segmentation fault`, `zend_mm_heap corrupted`, `double free` (UAF/corruption)
-- `Maximum execution time` (timeout)
-- POST requests returning 5xx, grouped by client IP
-
-Flags IPs that exceed `--post-500-threshold` (default: 5) POST-5xx as suspicious.
+Parses Apache/nginx access logs for OOM, UAF, segfault, double-free, timeouts,
+and POST-5xx grouped by client IP. Flags IPs that exceed `--post-500-threshold`.
 
 ### `audit`
 Scans audit/sensor logs for `Content-Disposition: form-data; ... filename=""`
 entries — the **golden indicator** of CVE-2026-109618 exploitation attempts.
-Flags as `vulnerable` when count exceeds `--empty-parts-threshold` (default: 3).
 
 ### `asan`
-Parses AddressSanitizer report files. Extracts:
-- Error type (`heap-use-after-free`, `heap-buffer-overflow`, `double-free`, etc.)
-- Stack frames (up to 15)
-
-```bash
-python3 php2shell-detect.py --mode asan --asan-files /tmp/asan.1234,/tmp/asan.5678
-```
+Parses AddressSanitizer report files. Extracts error type and stack frames.
 
 ### `error-signature`
-Classifies log entries into 6 categories (`oom`, `uaf`, `heap_corrupt`,
-`segfault`, `invalid_ptr`, `double_free`) and builds **temporal correlations**:
+Classifies log entries into 6 categories and builds **temporal correlations**:
 if the same client IP emits errors from two different categories within a
 30-line window, that's a strong signal of successful exploitation.
 
 ### `differential`
 Compares two targets (e.g. patched vs unpatched) across 5 probes and reports
-differences in status code, body hash, and `X-Powered-By`. Useful for
-validating that a patch actually changed behavior.
-
-```bash
-python3 php2shell-detect.py --mode differential \
-  -t http://vuln.lab.local --target-b http://patched.lab.local
-```
+differences in status code, body hash, and `X-Powered-By`.
 
 ### `ioc`
-Walks a directory tree and flags:
-- Filenames matching webshell patterns (`shell.php`, `c99.php`, `wso.php`,
-  `b374k.php`, `alfa.php`, etc.)
-- PHP files whose first 8KB contain `eval(base64_decode(...))`,
-  `eval(gzinflate(...))`, `eval(str_rot13(...))`, or
-  `eval($_POST/GET/REQUEST[...])`
-
-```bash
-python3 php2shell-detect.py --mode ioc --ioc-dir /var/www/html --ioc-max-files 500000
-```
+Walks a directory tree and flags webshell filenames and PHP files whose
+first 8KB contain `eval(base64_decode(...))` and similar patterns.
 
 ---
 
@@ -317,49 +295,22 @@ These modes send multipart POST payloads that trigger the crash primitive.
 They require `--i-own-this-target`. They are **concurrent** (configurable
 with `--workers`).
 
-### `lab-verify`
-Sends `--rounds` POST requests, each containing `--fields` empty-filename
-multipart parts. Counts crashes (5xx / connection reset / timeout).
-
-- ≥2 crashes → `vulnerable`
-- 1 crash → `unknown`
-- 0 crashes → `safe`
-
-Supports `--dry-run` to preview without sending.
-
-### `crash-repro`
-Like `lab-verify` but records a per-round signature (`status:error:elapsed`)
-for forensic comparison across runs.
-
-### `impact-session-write`
-Plants a marker via `PHP_SESSION_UPLOAD_PROGRESS`, then checks a server-side
-session file (`--session-file`) for the marker. Proves the write primitive.
-
-### `impact-session-poison`
-Three-step chain: establish session → poison with marker + crash trigger →
-read back. If marker is reflected, integrity impact is confirmed.
-
-### `impact-worker-leak`
-Writes a marker into session A, then reads session B (different SID). If the
-marker appears in B's response, cross-session memory leak is confirmed —
-the most severe confidentiality impact.
-
-### `impact-bounded-dos`
-20+ concurrent crash requests, then waits up to 30s for recovery. Reports
-`crash_rate_pct`, `median_response_s`, `recovered_after_s`.
-
-### `impact-memory-disclosure`
-Triggers crash responses and scans response bodies for memory-disclosure
-patterns (NULL bytes, pointers, Zend internals, session IDs from other
-users). Reports pattern counts only — never raw leaked content.
+| Mode | Proves |
+|------|--------|
+| `lab-verify` | Crash primitive fires (5xx / reset / timeout) |
+| `crash-repro` | Same, with per-round forensic signatures |
+| `impact-session-write` | Write primitive (marker in session file) |
+| `impact-session-poison` | Integrity impact (marker reflected in follow-up) |
+| `impact-worker-leak` | Confidentiality impact (cross-session leak) |
+| `impact-bounded-dos` | Availability impact (crash rate + recovery time) |
+| `impact-memory-disclosure` | Memory disclosure patterns in crash responses |
 
 ---
 
 ## Offensive Modes (Bounded, Double Opt-In)
 
 These modes prove concrete attacker capabilities. They are gated behind
-**both** `--i-own-this-target` **and** `--enable-offensive`. Either flag
-alone is insufficient — the mode will be skipped.
+**both** `--i-own-this-target` **and** `--enable-offensive`.
 
 > ⚠️ **BOUNDED BY DESIGN**
 >
@@ -367,97 +318,114 @@ alone is insufficient — the mode will be skipped.
 > They do **NOT** execute remote commands, drop webshells, read
 > `/etc/passwd`, exfiltrate user data, or pivot to other hosts.
 
-### `offensive-session-lfi`
+### `offensive-session-lfi` (enhanced in v3.5)
 **Proves:** the write primitive (planted marker) is reachable via file-include
-sinks, turning it into a read primitive.
+sinks AND via `php://filter` wrappers — proving both read primitive AND
+filter-chain reachability.
 
-**How:**
-1. Plant a marker in a session file via the crash primitive
-2. Try common LFI parameter names (`include`, `page`, `file`, `path`,
-   `template`, `doc`, `view`, `load`, `module`) pointing at the session
-   file path (`/tmp/sess_<sid>`, `/var/lib/php/sessions/sess_<sid>`)
-3. If the marker appears in any response, the read primitive is confirmed
-
-**Real-world implication:** an attacker can include attacker-controlled
-session files into PHP execution context. Combined with PHP filter wrappers
-(`php://filter/...`), this is a known RCE vector.
-
-```bash
-python3 php2shell-detect.py --mode offensive-session-lfi \
-  -t http://lab.local --i-own-this-target --enable-offensive \
-  --include-params "include,page,file,template,src"
-```
+**v3.5 enhancement:** now tests `php://filter/convert.base64-encode/resource=...`
+and `php://filter/read=string.rot13/resource=...` in addition to plain LFI.
+A hit on a filter wrapper means the Synacktiv filter-chain RCE technique
+applies.
 
 ### `offensive-session-traversal`
 **Proves:** the planted marker is reachable via path-traversal on download
 / file-serving endpoints, expanding the attack surface beyond LFI sinks.
 
-**How:**
-1. Plant marker via crash primitive
-2. Probe endpoints (`/download.php`, `/file.php`, `/getfile.php`, `/fetch.php`,
-   `/files.php`, `/read.php`, `/index.php`) with parameters
-   (`file`, `name`, `path`, `f`, `id`, `doc`, `src`)
-3. Use traversal prefixes (`../` repeated 1-7 times) pointing at the session file
-4. If marker appears, secondary read vector confirmed
-
-**Bounded:** only points at our own session file, never at `/etc/passwd`,
-config files, or other sensitive paths.
-
-```bash
-python3 php2shell-detect.py --mode offensive-session-traversal \
-  -t http://lab.local --i-own-this-target --enable-offensive \
-  --docroot-guesses "/download.php,/file.php,/getfile.php"
-```
-
-### `offensive-upload-bypass-verify`
+### `offensive-upload-bypass-verify` (enhanced in v3.5)
 **Proves:** file-upload extension validation can be bypassed during the
 corrupted window — a direct code-execution impact vector.
 
-**How:**
-1. Fire the crash primitive and a benign `.php` upload **near-simultaneously**
-   (race the corrupted window)
-2. The uploaded probe contains **only** `<?php echo '<marker>'; phpinfo(); ?>`
-   — no backdoor, no command execution
-3. After successful upload (2xx), fetch the probe at common upload paths
-   (`/uploads/`, `/files/`, `/upload/`, `/`)
-4. If the marker is visible, the probe was uploaded **and executed** —
-   code-execution impact confirmed
-
-**Bounded:** the probe is a `phpinfo()` call with a random marker. The
-operator must manually delete the probe file after testing.
-
-```bash
-python3 php2shell-detect.py --mode offensive-upload-bypass-verify \
-  -t http://lab.local --i-own-this-target --enable-offensive \
-  --upload-endpoint /upload.php --rounds 20 --workers 8
-```
-
-> 🧹 **Cleanup reminder:** if the probe lands, delete it:
-> ```bash
-> rm /var/www/html/uploads/php2shell_probe_*.php
-> ```
+**v3.5 enhancement:** now tests **8 extensions** (`.php`, `.phtml`, `.phar`,
+`.pht`, `.php5`, `.php7`, `.php8`, `.shtml`) across 7 upload directories.
+Many Apache/Nginx configs block `.php` but miss `.phtml`/`.phar`/`.pht`.
 
 ### `offensive-race-poison-confirm`
 **Proves:** the crash primitive defeats `session.upload_progress.cleanup`,
 making poisoned session content persistent — a stepping stone toward
 LFI → RCE chains.
 
-**How:**
-1. Fire 50+ concurrent plant+crash requests, each writing a marker via
-   `PHP_SESSION_UPLOAD_PROGRESS`
-2. After all requests complete, scan the local session directories
-   (`/tmp`, `/var/lib/php/sessions`, `/var/lib/php`) for any `sess_*` file
-   containing the marker
-3. If the marker survived cleanup, the race was won
+---
 
-**Bounded:** only checks if **our own** marker is present in any `sess_*`
-file. Does not read content of session files belonging to other users.
+## Offensive RCE Modes (Proves Code Execution)
 
-```bash
-python3 php2shell-detect.py --mode offensive-race-poison-confirm \
-  -t http://lab.local --i-own-this-target --enable-offensive \
-  --rounds 100 --workers 16
-```
+> 🆕 **NEW in v3.5** — These modes prove **actual PHP code execution**,
+> not just file read. They are gated behind the same double opt-in
+> (`--i-own-this-target` + `--enable-offensive`).
+
+Each mode plants `<?php echo 'MARKER'; ?>` (a benign PHP snippet that ONLY
+prints a marker string — no `system()`, no `file_put_contents()`, no
+persistence) and tries to get PHP to execute it. If the marker appears in
+a response **without** the surrounding `<?php ?>` tags, the code executed.
+
+### `offensive-phpcode-exec-proof`
+**Proves:** RCE via session file inclusion.
+
+1. Plants `<?php echo 'RCECONFIRMED_<rand>'; ?>` in a session file via the crash primitive
+2. Tries to include the session file via LFI sinks (plain + `php://filter`)
+3. If marker appears WITHOUT `<?php` tags → **code executed**
+
+**Distinguishing logic:**
+- `marker present, <?php absent` → **RCE CONFIRMED** (code executed)
+- `marker present, <?php present` → file read but NOT executed
+- `<?php payload raw` → file not even read
+
+### `offensive-filter-chain-rce`
+**Proves:** the Synacktiv filter-chain RCE technique applies.
+
+Tests whether `php://filter/convert.base64-encode/resource=php://input` and
+`php://filter/read=string.rot13/resource=php://input` are reachable through
+LFI sinks. If the base64/rot13 of our marker appears, the filter chain is
+being evaluated — meaning an attacker can generate arbitrary PHP code
+byte-by-byte via `convert.iconv.*` filters without needing any controllable
+file on disk.
+
+**Reference:** [Synacktiv — PHP filter chains: file read from arbitrary to RCE](https://www.synacktiv.com/en/publications/php-filter-chains-file-read-from-arbitrary-to-rce.html)
+
+### `offensive-phar-deserialization`
+**Proves:** PHAR deserialization RCE.
+
+1. Generates a minimal `.phar` file locally (requires `php` CLI; falls back
+   to a stub if unavailable) whose metadata class has a `__destruct()` method
+   that echoes a marker
+2. Uploads the `.phar` via the upload endpoint (racing the crash primitive)
+3. Probes LFI/file sinks with `phar://` URLs pointing at the uploaded file
+4. If marker appears → **`__destruct()` executed → deserialization RCE confirmed**
+
+**Real-world implication:** an attacker can replace the echo with a gadget
+chain (Monolog/RCE1, Doctrine, etc.) for arbitrary command execution.
+
+### `offensive-tmpfile-race`
+**Proves:** RCE via PHP temporary upload file race.
+
+When PHP handles a multipart upload, it writes the uploaded file to
+`/tmp/php<XXXXXX>` before moving it. If the worker crashes mid-upload
+(CVE-2026-109618), the temp file may linger. An attacker can race to
+include that temp file via LFI before PHP cleans it up.
+
+This mode races the crash primitive against LFI inclusion attempts at
+guessed `/tmp/php*` paths (20 guesses per round). If the planted PHP code
+executes, RCE is confirmed.
+
+**Advantage:** works even when no session file is writable — only requires
+an LFI sink and the crash primitive to linger temp files.
+
+### `offensive-log-poisoning`
+**Proves:** RCE via access log poisoning + LFI.
+
+1. Sends requests with `User-Agent: <?php echo 'LOGRCE_<rand>'; ?>` (poisons the access log)
+2. Tries to include common log paths via LFI:
+   - `/var/log/nginx/access.log`
+   - `/var/log/apache2/access.log`
+   - `/var/log/httpd/access_log`
+   - `/var/log/access.log`
+   - `/var/log/php/error.log`
+   - `/var/log/php-fpm/error.log`
+   - `/proc/self/fd/0`
+3. If marker appears WITHOUT `<?php` tags → **log poisoned + executed**
+
+**Advantage:** requires no file upload capability — only an LFI sink and a
+readable log path.
 
 ---
 
@@ -472,15 +440,12 @@ one, or `--mode mode1,mode2,...` for a custom list.
 | `standard` | + `local`, `logs`, `audit` | Default passive check |
 | `deep` | + `deep-fingerprint`, `asan`, `error-signature` | Full passive investigation |
 | `impact` | `lab-verify`, `crash-repro`, `impact-memory-disclosure` | Lab impact proof |
-| `offensive` | All 4 offensive modes | Authorized impact proof |
+| `offensive` | 4 bounded offensive modes (read primitive) | Authorized read-impact proof |
+| **`offensive-rce`** 🆕 | 5 RCE-proof modes | Authorized RCE-impact proof |
 | `full` | All defensive + all impact | Most comprehensive non-offensive |
-| `full+offensive` | Everything | Maximum coverage (double opt-in required) |
+| `full+offensive` | Everything in `full` + 4 bounded offensive | + read primitive |
+| **`full+rce`** 🆕 | Everything in `full+offensive` + 5 RCE-proof | Maximum coverage |
 | `local-only` | `local`, `logs`, `audit`, `asan`, `error-signature` | Server self-scan, no target needed |
-
-```bash
-# List available profiles
-python3 php2shell-detect.py --help | grep -A2 profile
-```
 
 ---
 
@@ -501,7 +466,7 @@ python3 php2shell-detect.py --help | grep -A2 profile
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--timeout SECONDS` | `15.0` | Per-request timeout |
-| `--user-agent, --ua STRING` | `php2shell-detect/3.4 (+defensive triage; ...)` | Custom User-Agent |
+| `--user-agent, --ua STRING` | `php2shell-detect/3.5 (+defensive triage; ...)` | Custom User-Agent |
 | `--insecure, -k` | off | Disable TLS certificate verification |
 | `--probe-phpinfo` | off | Probe `/phpinfo.php`, `/info.php`, `/test.php` for version |
 
@@ -509,7 +474,7 @@ python3 php2shell-detect.py --help | grep -A2 profile
 
 | Flag | Description |
 |------|-------------|
-| `--log-files CSV` | Comma-separated access/error log paths (`--mode logs`) |
+| `--log-files CSV` | Comma-separated access/error log paths (`--mode logs`) — also reused by `offensive-log-poisoning` |
 | `--audit-file PATH` | Audit/sensor log path (`--mode audit`) |
 | `--asan-files CSV` | Comma-separated ASAN report paths (`--mode asan`) |
 | `--signature-files CSV` | Comma-separated error log paths (`--mode error-signature`) |
@@ -526,7 +491,7 @@ python3 php2shell-detect.py --help | grep -A2 profile
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--rounds N` | `5` | Rounds for `lab-verify` / `crash-repro` |
+| `--rounds N` | `5` | Rounds for `lab-verify` / `crash-repro` / `offensive-tmpfile-race` |
 | `--fields N` | `200` | Empty multipart parts per round |
 | `--workers N` | `4` | Concurrent workers (use `1` for ASAN runs) |
 | `--session-id SID` | random | PHPSESSID for `impact-session-write` |
@@ -537,8 +502,8 @@ python3 php2shell-detect.py --help | grep -A2 profile
 
 | Flag | Description |
 |------|-------------|
-| `--upload-endpoint PATH` | Upload endpoint for `offensive-upload-bypass-verify` (e.g. `/upload.php`) |
-| `--include-params CSV` | Custom LFI parameter names for `offensive-session-lfi` (default: `include,page,file,path,template,doc,view,load,module`) |
+| `--upload-endpoint PATH` | Upload endpoint for `offensive-upload-bypass-verify` and `offensive-phar-deserialization` (e.g. `/upload.php`) |
+| `--include-params CSV` | Custom LFI parameter names for all offensive-* modes (default: `include,page,file,path,template,doc,view,load,module`) |
 | `--docroot-guesses CSV` | Custom file endpoints for `offensive-session-traversal` (default: `/download.php,/file.php,/getfile.php,/fetch.php,/index.php,/files.php,/read.php`) |
 
 ### Thresholds
@@ -634,17 +599,9 @@ python3 php2shell-detect.py -t http://lab.local --profile impact \
   --impact-report ./impact.md
 ```
 
-**Session write primitive proof (requires server-side file access):**
-```bash
-python3 php2shell-detect.py -t http://lab.local --mode impact-session-write \
-  --i-own-this-target \
-  --session-file /var/lib/php/sessions/sess_<PHPSESSID> \
-  -o session-write.json
-```
+### Bounded Offensive Proof (requires double opt-in)
 
-### Offensive Impact Proof (requires double opt-in)
-
-**LFI read primitive proof:**
+**LFI read primitive proof (now with php://filter support):**
 ```bash
 python3 php2shell-detect.py -t http://lab.local --mode offensive-session-lfi \
   --i-own-this-target --enable-offensive \
@@ -660,7 +617,7 @@ python3 php2shell-detect.py -t http://lab.local --mode offensive-session-travers
   -o traversal-proof.json
 ```
 
-**Upload bypass → code execution proof:**
+**Upload bypass → code execution proof (now tests 8 extensions):**
 ```bash
 python3 php2shell-detect.py -t http://lab.local --mode offensive-upload-bypass-verify \
   --i-own-this-target --enable-offensive \
@@ -677,14 +634,75 @@ python3 php2shell-detect.py -t http://lab.local --mode offensive-race-poison-con
   -o race-proof.json
 ```
 
-**Full offensive profile (all 4 modes):**
+### RCE Proof (requires double opt-in) — NEW in v3.5
+
+**Direct PHP code execution proof via session LFI:**
 ```bash
-python3 php2shell-detect.py -t http://lab.local --profile offensive \
+python3 php2shell-detect.py -t http://lab.local --mode offensive-phpcode-exec-proof \
+  --i-own-this-target --enable-offensive \
+  --include-params "include,page,file,template,src,doc" \
+  -o rce-proof.json
+```
+
+**Filter-chain RCE reachability proof:**
+```bash
+python3 php2shell-detect.py -t http://lab.local --mode offensive-filter-chain-rce \
+  --i-own-this-target --enable-offensive \
+  --include-params "include,page,file,template" \
+  -o filter-chain-proof.json
+```
+
+**PHAR deserialization RCE proof:**
+```bash
+python3 php2shell-detect.py -t http://lab.local --mode offensive-phar-deserialization \
   --i-own-this-target --enable-offensive \
   --upload-endpoint /upload.php \
+  --include-params "include,page,file,template" \
+  --rounds 20 --workers 8 \
+  -o phar-rce-proof.json
+```
+
+**Temp file race RCE proof:**
+```bash
+python3 php2shell-detect.py -t http://lab.local --mode offensive-tmpfile-race \
+  --i-own-this-target --enable-offensive \
+  --include-params "include,page,file,template" \
+  --rounds 100 --workers 16 \
+  -o tmpfile-rce-proof.json
+```
+
+**Access log poisoning RCE proof:**
+```bash
+python3 php2shell-detect.py -t http://lab.local --mode offensive-log-poisoning \
+  --i-own-this-target --enable-offensive \
+  --include-params "include,page,file,template" \
+  --log-files "/var/log/nginx/access.log,/var/log/apache2/access.log" \
+  -o log-rce-proof.json
+```
+
+**Full RCE profile (all 5 RCE-proof modes):**
+```bash
+python3 php2shell-detect.py -t http://lab.local --profile offensive-rce \
+  --i-own-this-target --enable-offensive \
+  --upload-endpoint /upload.php \
+  --include-params "include,page,file,template,src,doc" \
   --rounds 30 --workers 8 \
-  --evidence-bundle ./offensive-evidence \
-  --impact-report ./offensive-impact.md
+  --evidence-bundle ./rce-evidence \
+  --impact-report ./rce-impact.md
+```
+
+### Full Coverage (defensive + impact + offensive + RCE)
+
+**Maximum coverage — everything:**
+```bash
+python3 php2shell-detect.py -t http://lab.local --profile full+rce \
+  --i-own-this-target --enable-offensive \
+  --upload-endpoint /upload.php \
+  --include-params "include,page,file,template,src,doc" \
+  --log-files /var/log/nginx/access.log \
+  --rounds 30 --workers 8 \
+  --evidence-bundle ./full-evidence \
+  --impact-report ./full-impact.md
 ```
 
 ### CI/CD Integration
@@ -706,12 +724,6 @@ else
   echo "OK: target appears safe"
   exit 0
 fi
-```
-
-**JSON output for parsing:**
-```bash
-python3 php2shell-detect.py --local --json | \
-  jq '.summary | {final_verdict, severity, confidence}'
 ```
 
 ### Generating the ASAN Reproduction Guide
@@ -753,29 +765,8 @@ Example GitHub Actions step:
 ## Output Formats
 
 ### JSON Report (`--output`)
-Machine-readable, suitable for SIEM ingestion or CI/CD parsing:
-
-```json
-{
-  "tool": "php2shell-detect",
-  "version": "3.4",
-  "generated_at": "2026-10-21T20:24:15Z",
-  "meta": { "target": "...", "profile": "...", "offensive_enabled": false },
-  "summary": {
-    "final_verdict": "vulnerable",
-    "severity": "critical",
-    "confidence": 0.85,
-    "total_modes": 5,
-    "verdicts": { "vulnerable": 2, "unknown": 1, "safe": 2 },
-    "vulnerable_modes": ["impact-session-poison", "offensive-session-lfi"]
-  },
-  "evidence_chain": [
-    { "label": "remote", "verdict": "vulnerable", "detail": "PHP 8.3.30" },
-    ...
-  ],
-  "results": [ ... ]
-}
-```
+Machine-readable, suitable for SIEM ingestion or CI/CD parsing. Includes
+`summary`, `evidence_chain`, and full per-mode `results`.
 
 ### Markdown Report (`--markdown`)
 Human-readable, suitable for sharing with management or attaching to tickets.
@@ -790,31 +781,22 @@ Ideal for incident response handoff.
 
 ### Impact Report (`--impact-report`)
 Dedicated Markdown report focused on impact proofs (integrity, confidentiality,
-availability, memory-corruption, offensive proofs).
+availability, memory-corruption, offensive proofs, RCE proofs).
 
 ### stdout JSON (`--json`)
 Prints the full JSON report to stdout, suppressing human-readable output.
-Useful for piping to `jq` or another tool.
 
 ---
 
 ## ASAN Reproduction Guide
 
-The tool can generate a complete guide for reproducing the memory-corruption
-proof under AddressSanitizer:
-
 ```bash
 python3 php2shell-detect.py --mode generate-asan-repro --asan-outdir ./asan-guide
 ```
 
-This writes `./asan-guide/asan-repro.md` with:
-1. Building PHP from source with `-fsanitize=address`
-2. Starting a sandboxed PHP CGI server with ASAN
-3. Sending the crash trigger (using this tool's `--mode lab-verify`)
-4. Reading and interpreting the ASAN report
-5. Triaging the stack trace to identify the vulnerable function
-6. Confirming CVE-2026-109619 (cross-session leak)
-7. Patching and re-verifying
+Writes `./asan-guide/asan-repro.md` with 7 sections covering building PHP
+with ASAN, sending the crash trigger, reading/interpreting ASAN reports,
+and confirming CVE-2026-109619.
 
 > 💡 When running `--mode lab-verify` against an ASAN build, always use
 > `--workers 1` — concurrent requests hide the single-threaded bug location
@@ -826,34 +808,38 @@ This writes `./asan-guide/asan-repro.md` with:
 
 ### Authorization
 
-- **Passive modes** (`remote`, `surface`, `deep-fingerprint`, `local`,
-  `logs`, `audit`, `asan`, `error-signature`, `differential`, `ioc`):
-  These send only standard GET/HEAD requests or read local files. They are
-  generally safe to run against any target, but always respect the target's
-  `robots.txt`, ToS, and local laws.
+- **Passive modes**: send only standard GET/HEAD requests or read local
+  files. Generally safe to run against any target, but always respect the
+  target's `robots.txt`, ToS, and local laws.
 
-- **Impact modes** (`lab-verify`, `crash-repro`, `impact-*`): These send
-  multipart POST payloads that can crash PHP workers. **Only run against
-  infrastructure you own or have explicit written authorization to test.**
-  The `--i-own-this-target` flag is required.
+- **Impact modes**: send multipart POST payloads that can crash PHP workers.
+  **Only run against infrastructure you own or have explicit written
+  authorization to test.** The `--i-own-this-target` flag is required.
 
-- **Offensive modes** (`offensive-*`): These prove concrete attacker
-  capabilities. **Only run against infrastructure you own or have explicit
-  written authorization to test.** Both `--i-own-this-target` AND
-  `--enable-offensive` are required (double opt-in).
+- **Offensive modes** (read primitive + RCE proof): prove concrete attacker
+  capabilities including code execution. **Only run against infrastructure
+  you own or have explicit written authorization to test.** Both
+  `--i-own-this-target` AND `--enable-offensive` are required (double opt-in).
 
-### What the offensive modes will NOT do
+### What the offensive/RCE modes will NOT do
 
 - ❌ Execute remote commands (`system()`, `shell_exec()`, `passthru()`, etc.)
 - ❌ Drop persistent backdoors or webshells
 - ❌ Read system files (`/etc/passwd`, config files, etc.)
 - ❌ Exfiltrate user data, credentials, or session content from other users
 - ❌ Pivot to other hosts on the network
-- ❌ Anything beyond planting and reading back a random marker string
+- ❌ Anything beyond planting `<?php echo 'MARKER'; ?>` and checking if it executed
 
-The uploaded probe in `offensive-upload-bypass-verify` contains only
-`<?php echo '<marker>'; phpinfo(); ?>` — no backdoor, no command execution.
-The operator is responsible for deleting the probe file after testing.
+The uploaded probe in `offensive-upload-bypass-verify` and the planted code
+in `offensive-phpcode-exec-proof` / `offensive-tmpfile-race` /
+`offensive-log-poisoning` contains only `<?php echo '<marker>'; ?>` — no
+backdoor, no command execution. The operator is responsible for deleting
+any probe files after testing:
+
+```bash
+rm /var/www/html/uploads/php2shell_probe_*.php
+rm /var/www/html/uploads/php2shell_phar_*.phar
+```
 
 ### Responsible Disclosure
 
@@ -919,6 +905,7 @@ SOFTWARE.
 - The PHP Security Team for their ongoing work on the parser
 - The AddressSanitizer project for the instrumentation that makes
   memory-corruption bugs reproducible
+- Synacktiv for the PHP filter-chain RCE research
 - The defensive security community for feedback on detection patterns
 
 ---
@@ -926,3 +913,4 @@ SOFTWARE.
 <p align="center">
   <sub>Built by <a href="https://github.com/NULL200OK">NULL200OK</a> — stay defensive, stay authorized.</sub>
 </p>
+
